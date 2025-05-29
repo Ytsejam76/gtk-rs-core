@@ -244,12 +244,25 @@ macro_rules! task_impl {
             #[doc(alias = "g_task_return_error")]
             #[allow(unused_unsafe)]
             pub $($safety)? fn return_result(self, result: Result<V, glib::Error>) {
+                use std::any;
+
                 #[cfg(not(feature = "v2_64"))]
                 unsafe extern "C" fn value_free(value: *mut libc::c_void) {
                     let _: glib::Value = from_glib_full(value as *mut glib::gobject_ffi::GValue);
                 }
 
                 match result {
+                    Ok(v) if any::TypeId::of::<V>() == any::TypeId::of::<bool>() => {
+                        unsafe {
+                            let res: bool = *(&v as *const V as *const bool);
+                            let res = if res { glib::ffi::GTRUE } else { glib::ffi::GFALSE };
+
+                            ffi::g_task_return_boolean(
+                                self.to_glib_none().0,
+                                res
+                            );
+                        }
+                    }
                     #[cfg(feature = "v2_64")]
                     Ok(v) => unsafe {
                         ffi::g_task_return_value(
@@ -279,36 +292,54 @@ macro_rules! task_impl {
             #[allow(unused_unsafe)]
             pub $($safety)? fn propagate(self) -> Result<V, glib::Error> {
                 let mut error = ptr::null_mut();
+                use std::any;
 
-                unsafe {
-                    #[cfg(feature = "v2_64")]
-                    {
-                        let mut value = glib::Value::uninitialized();
-                        ffi::g_task_propagate_value(
+                if any::TypeId::of::<V>() == any::TypeId::of::<bool>() {
+                    unsafe {
+                        let value =
+                            ffi::g_task_propagate_boolean(
                             self.to_glib_none().0,
-                            value.to_glib_none_mut().0,
                             &mut error,
-                        );
+                            );
 
+                        let value = glib::value::Value::from(value == glib::ffi::GTRUE);
                         if error.is_null() {
                             Ok(V::from_value(&value))
                         } else {
                             Err(from_glib_full(error))
                         }
                     }
+                } else {
+                    unsafe {
+                         #[cfg(feature = "v2_64")]
+                        {
+                            let mut value = glib::Value::uninitialized();
+                            ffi::g_task_propagate_value(
+                                self.to_glib_none().0,
+                                value.to_glib_none_mut().0,
+                                &mut error,
+                            );
 
-                    #[cfg(not(feature = "v2_64"))]
-                    {
-                        let value = ffi::g_task_propagate_pointer(self.to_glib_none().0, &mut error);
+                            if error.is_null() {
+                                Ok(V::from_value(&value))
+                            } else {
+                                Err(from_glib_full(error))
+                            }
+                        }
 
-                        if error.is_null() {
-                            let value = Option::<glib::Value>::from_glib_full(
-                                value as *mut glib::gobject_ffi::GValue,
-                            )
-                            .expect("Task::propagate() called before Task::return_result()");
-                            Ok(V::from_value(&value))
-                        } else {
-                            Err(from_glib_full(error))
+                        #[cfg(not(feature = "v2_64"))]
+                        {
+                            let value = ffi::g_task_propagate_pointer(self.to_glib_none().0, &mut error);
+
+                            if error.is_null() {
+                                let value = Option::<glib::Value>::from_glib_full(
+                                    value as *mut glib::gobject_ffi::GValue,
+                                )
+                                .expect("Task::propagate() called before Task::return_result()");
+                                Ok(V::from_value(&value))
+                            } else {
+                                Err(from_glib_full(error))
+                            }
                         }
                     }
                 }
@@ -469,6 +500,30 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_bool_async_result() {
+        let fut = run_async_local::<Result<bool, glib::Error>, _>(|tx, l| {
+            let cancellable = crate::Cancellable::new();
+            let task = unsafe {
+                crate::LocalTask::new(
+                    None,
+                    Some(&cancellable),
+                    move |t: LocalTask<bool>, _b: Option<&glib::Object>| {
+                        tx.send(t.propagate()).unwrap();
+                        l.quit();
+                    },
+                )
+            };
+            task.return_result(Ok(true));
+        });
+
+        match fut {
+            Err(_) => panic!(),
+            Ok(i) => assert_eq!(i, true),
+        }
+    }
+
+ 
     #[test]
     fn test_object_async_result() {
         use glib::subclass::prelude::*;
